@@ -13,7 +13,7 @@ from qdrant_client.http.exceptions import UnexpectedResponse
 QDRANT_HOST = "localhost" 
 QDRANT_PORT = 6333
 QDRANT_COLLECTION = "lsm_signs"
-PORT = 8080
+PORT = 7777
 
 # Inicializar MediaPipe Hand Solutions
 # Nota: Hands.process() necesita una imagen RGB, cv2.imdecode da BGR.
