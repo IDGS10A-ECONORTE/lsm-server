@@ -39,7 +39,7 @@ RUN pip install --no-cache-dir jax==0.4.28
 # 4. COPY PROJECT CODE
 COPY . .
 
-EXPOSE 8080
+EXPOSE 7777
 
 # 5. EXECUTION COMMAND
 CMD ["python", "lsm_server.py"]

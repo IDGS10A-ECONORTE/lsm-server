@@ -6,7 +6,7 @@ services:
     image: lsm-server:dev
     container_name: lsm-server
     ports:
-      - 8080:8080
+      - 7777:7777
     volumes:
       - ./:/python
     depends_on: 
