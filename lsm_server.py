@@ -9,14 +9,12 @@ from qdrant_client import QdrantClient, models
 from qdrant_client.http.exceptions import UnexpectedResponse
 
 # --- CONFIGURACIÓN GLOBAL ---
-# Si Python corre en Docker Compose, usar "qdrant". Si es local, usar "localhost".
-QDRANT_HOST = "localhost" 
+QDRANT_HOST = "localhost" # Usar "qdrant" si usas Docker Compose
 QDRANT_PORT = 6333
 QDRANT_COLLECTION = "lsm_signs"
-PORT = 7777
+PORT = 7777 # Usando el puerto que especificaste
 
 # Inicializar MediaPipe Hand Solutions
-# Nota: Hands.process() necesita una imagen RGB, cv2.imdecode da BGR.
 mp_hands = mp.solutions.hands
 hands = mp_hands.Hands(
     static_image_mode=False,
@@ -25,7 +23,7 @@ hands = mp_hands.Hands(
     min_tracking_confidence=0.5
 )
 
-# Inicializar Cliente Qdrant (fuera del async main para evitar recreación)
+# Inicializar Cliente Qdrant (debe ser accesible al iniciar)
 qdrant_client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
 
 # Diccionario para mantener las conexiones activas y el estado de los jugadores
@@ -58,7 +56,7 @@ def get_normalized_hand_vector(results):
     l9 = relative_landmarks[9]
     d_ref = np.sqrt(l9[0]**2 + l9[1]**2 + l9[2]**2)
     
-    # Manejar caso de división por cero (ej. mano no detectada o detección pobre)
+    # Manejar caso de división por cero (ej. mano muy cerca o detección pobre)
     if d_ref < 1e-6: 
         return None, None
         
@@ -74,7 +72,6 @@ def get_normalized_hand_vector(results):
         z_scaled = z_prime / d_ref
         
         # Aplicar Mirroring (Reflexión en X para mano izquierda - zurdos)
-        # Esto estandariza todas las manos a una perspectiva de "Mano Derecha"
         if handedness == 'Left':
             x_scaled *= -1
             
@@ -84,7 +81,7 @@ def get_normalized_hand_vector(results):
     return final_vector, handedness
 
 # ----------------------------------------------------------------------
-# LÓGICA DE VALIDACIÓN Y WEBSOCKET
+# LÓGICA DE VALIDACIÓN DE QDRANT
 # ----------------------------------------------------------------------
 
 def validate_sign_against_qdrant(vector, target_sign):
@@ -109,46 +106,57 @@ def validate_sign_against_qdrant(vector, target_sign):
         search_result = qdrant_client.search(
             collection_name=QDRANT_COLLECTION,
             query_vector=vector,
-            query_filter=query_filter, # Aplicar el filtro del minijuego/objetivo
+            query_filter=query_filter, 
             limit=1 
         )
 
         # 3. Evaluación del Resultado
-        if search_result and search_result[0].score > 0.80: # Usar un umbral de similitud (ej. 80%)
+        # Nota: Puedes ajustar el umbral 0.80 (80%) según la precisión de tu entrenamiento
+        if search_result and search_result[0].score > 0.80: 
+            # La seña más cercana del target deseado tiene una alta similitud
             return True, f"¡Seña Correcta! Similitud: {search_result[0].score:.2f}"
         else:
-            # Si el target no se encuentra con suficiente similitud
+            # No se encontró una coincidencia con el umbral de similitud
             return False, "Seña incorrecta o similitud insuficiente."
 
     except UnexpectedResponse as e:
-        # Esto ocurre si la colección no existe o la dimensión es incorrecta (60D vs la colección)
-        return False, f"Error Qdrant (Colección): Verifica la inicialización."
+        print(f"Error Qdrant (Colección): {e}")
+        return False, f"Error Qdrant: Colección '{QDRANT_COLLECTION}' no lista o dimensiones incorrectas."
     except Exception as e:
         print(f"Error grave en la consulta a Qdrant: {e}")
-        return False, "Error interno del servidor."
+        return False, "Error interno del servidor al consultar DB."
 
+# ----------------------------------------------------------------------
+# BUCLE PRINCIPAL DEL WEBSOCKET (Manejo de Conexión y Datos)
+# ----------------------------------------------------------------------
 
-async def process_player_image(websocket, path):
+async def process_player_image(websocket):
     """Maneja la conexión de un jugador y el ciclo de juego."""
     
-    # Asignar ID y estado inicial al jugador
     player_id = len(CONNECTED_PLAYERS) + 1
     CONNECTED_PLAYERS[websocket] = {'player_id': player_id, 'target_sign': 'A', 'is_active': True}
     print(f"[Conexión] Jugador {player_id} conectado.")
     
     try:
+        # Envía el estado inicial al cliente
         await websocket.send(json.dumps({
             "status": "CONNECTED", 
             "player_id": player_id, 
-            "message": "Esperando comandos de Godot..."
+            "target": CONNECTED_PLAYERS[websocket]['target_sign'],
+            "message": "Esperando comandos o imágenes..."
         }))
 
         async for message in websocket:
-            data = json.loads(message)
             
-            # 1. COMANDO DE CONTROL (Desde Godot)
+            # Intento de deserialización del mensaje JSON
+            try:
+                data = json.loads(message)
+            except json.JSONDecodeError:
+                print(f"Error JSON de Jugador {player_id}. Mensaje descartado.")
+                continue
+
+            # 1. COMANDO DE CONTROL
             if data.get('command') == 'SET_TARGET':
-                # Establece el signo que el jugador debe realizar
                 new_target = data.get('sign', 'A').upper()
                 CONNECTED_PLAYERS[websocket]['target_sign'] = new_target
                 print(f"Jugador {player_id}: Objetivo establecido: {new_target}")
@@ -159,35 +167,46 @@ async def process_player_image(websocket, path):
             # 2. PROCESAMIENTO DE IMAGEN (Ciclo de juego)
             elif data.get('type') == 'image' and CONNECTED_PLAYERS[websocket]['target_sign'] != 'NONE':
                 
-                # Deserializar la imagen (Base64)
-                img_bytes = base64.b64decode(data['image_data'])
-                np_arr = np.frombuffer(img_bytes, np.uint8)
-                frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-
-                # Procesar la imagen (Convertir BGR a RGB para MediaPipe)
-                results = hands.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-                
-                # Obtener el vector de seña normalizado (60D)
-                hand_vector, handedness = get_normalized_hand_vector(results)
-
-                # Validar el vector contra el signo objetivo en Qdrant
+                is_correct = False
+                feedback = "Señal no detectada o error de procesamiento."
                 target_sign = CONNECTED_PLAYERS[websocket]['target_sign']
-                is_correct, feedback = validate_sign_against_qdrant(hand_vector, target_sign)
 
-                # 3. RESPONDER A GODOT
+                # Bloque try/except para el procesamiento de imagen
+                try:
+                    # Deserialización y decodificación
+                    img_bytes = base64.b64decode(data['image_data'])
+                    np_arr = np.frombuffer(img_bytes, np.uint8)
+                    frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+
+                    # Verificar validez de la imagen
+                    if frame is None or frame.size == 0:
+                        feedback = "Error de decodificación (Frame nulo o incompleto)."
+                    else:
+                        # Procesar y obtener el vector 60D
+                        results = hands.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                    
+                        hand_vector, handedness = get_normalized_hand_vector(results)
+
+                        # Validar contra Qdrant
+                        is_correct, feedback = validate_sign_against_qdrant(hand_vector, target_sign)
+
+                except Exception as proc_e:
+                    # Capturar cualquier fallo de procesamiento (ej. MediaPipe/Numpy/CV)
+                    print(f"ERROR DE PROCESAMIENTO JUGADOR {player_id}: {proc_e.__class__.__name__}")
+                    feedback = f"Error de Visión: {proc_e.__class__.__name__}"
+
+
+                # 3. RESPONDER AL CLIENTE (Movido fuera del try/except anidado)
                 await websocket.send(json.dumps({
                     "result": is_correct,
                     "feedback": feedback,
                     "target": target_sign,
-                    "hand_used": handedness # Útil para debug en Godot
                 }))
             
     except websockets.exceptions.ConnectionClosedOK:
         print(f"[Desconexión] Jugador {player_id} desconectado limpiamente.")
-    except json.JSONDecodeError:
-        print(f"Error JSON de Jugador {player_id}")
     except Exception as e:
-        print(f"[Error] Jugador {player_id} desconectado por error: {e}")
+        print(f"[Error Fatal] Jugador {player_id} forzado a desconectar: {e}")
     finally:
         # Limpieza de la conexión
         if websocket in CONNECTED_PLAYERS:
@@ -197,12 +216,18 @@ async def process_player_image(websocket, path):
 
 async def main():
     """Función principal para iniciar el servidor WebSocket."""
-    # Enlazar al host 0.0.0.0 para acceso desde el exterior (útil en Docker)
+    # Verificar la conexión inicial a Qdrant antes de iniciar el servidor WS
+    try:
+        qdrant_client.get_collections()
+        print("✅ Conexión inicial a Qdrant exitosa.")
+    except Exception as e:
+        print(f"❌ ADVERTENCIA: No se pudo conectar a Qdrant en {QDRANT_HOST}:{QDRANT_PORT}. El servidor iniciará, pero las validaciones fallarán. Error: {e}")
+        
     async with websockets.serve(process_player_image, "0.0.0.0", PORT):
         print("-------------------------------------------------------")
         print(f"Servidor WebSocket LSM iniciado en ws://0.0.0.0:{PORT}")
         print("-------------------------------------------------------")
-        await asyncio.Future() # Corre indefinidamente
+        await asyncio.Future()
 
 if __name__ == "__main__":
     try:

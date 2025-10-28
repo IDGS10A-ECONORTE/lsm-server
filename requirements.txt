@@ -2,10 +2,13 @@
 opencv-python-headless==4.8.1.78
 mediapipe==0.10.13
 numpy==1.26.4
+Pillow
 
 # Dependencias para ML y vectores
 jax==0.4.28
+jaxlib==0.4.28
 qdrant-client==1.8.0
+
 
 # Comunicación
 websockets

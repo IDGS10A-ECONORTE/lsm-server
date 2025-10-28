@@ -12,6 +12,7 @@ RUN apt-get update && \
         libsm6 \
         libxrender1 \
         libxext6 \
+        v4l-utils \
         # Clean up to reduce final image size
         && apt-get clean \
         && rm -rf /var/lib/apt/lists/*
@@ -36,8 +37,11 @@ RUN pip install --no-cache-dir jaxlib==0.4.28
 RUN pip install --no-cache-dir jax==0.4.28
 # -------------------------------------------
 
+
 # 4. COPY PROJECT CODE
 COPY . .
+# Instala el diccionario
+RUN python qdrant_init.py
 
 EXPOSE 7777
 

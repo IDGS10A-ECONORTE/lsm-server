@@ -1,39 +1,63 @@
 from qdrant_client import QdrantClient, models
-from qdrant_client.http import models as http_models
+# Usamos http_models para compatibilidad, aunque PayloadSchemaType fue traído a la raíz.
+from qdrant_client.http import models as http_models 
 from qdrant_client.http.models import PayloadSchemaType 
 import numpy as np
+import json
+import os
 
 # --- CONFIGURACIÓN DE CONEXIÓN Y ESTRUCTURA ---
 QDRANT_HOST = "localhost" 
 QDRANT_PORT = 6333
 COLLECTION_NAME = "lsm_signs"
-
-# 20 landmarks * 3 coordenadas (x, y, z) = 60 DIMENSIONES
 VECTOR_DIMENSION = 60
+DICTIONARY_FILE = "lsm_dictionary_data.txt" # Nombre del archivo generado por el recorder
 
-# --- DICCIONARIO BASE (SIMULANDO LA ESTRUCTURA QUE TE FUNCIONA) ---
-# Hemos unificado la estructura para asegurar que cada punto tenga un nivel de dificultad.
-# En la realidad, las claves "HOLA", "LSM", etc., DEBEN tener un nivel de dificultad asignado.
-# Aquí asumimos que los que no lo tienen son por defecto "MEDIO" o "FÁCIL".
+# --- FUNCIÓN DE CARGA DE DATOS ---
 
-MOCK_SIGNS_RAW = {
-    # Formato simple (se asume DIFICULTAD por defecto)
-    "HOLA": {"vector": np.random.rand(VECTOR_DIMENSION).tolist(), "difficulty": "MEDIO"},
-    "LSM": {"vector": np.random.rand(VECTOR_DIMENSION).tolist(), "difficulty": "MEDIO"},
-    "GRACIAS": {"vector": np.random.rand(VECTOR_DIMENSION).tolist(), "difficulty": "MEDIO"},
-    "JUGAR": {"vector": np.random.rand(VECTOR_DIMENSION).tolist(), "difficulty": "DIFÍCIL"},
-    "A": {"vector": np.random.rand(VECTOR_DIMENSION).tolist(), "difficulty": "FÁCIL"},
-    "B": {"vector": np.random.rand(VECTOR_DIMENSION).tolist(), "difficulty": "FÁCIL"},
-}
+def load_data_from_txt():
+    """
+    Lee el archivo TXT línea por línea, parsea cada línea como JSON y retorna
+    una lista de diccionarios, lista para ser insertada en Qdrant.
+    """
+    if not os.path.exists(DICTIONARY_FILE):
+        print(f"❌ ERROR: Archivo '{DICTIONARY_FILE}' no encontrado.")
+        print("Por favor, usa 'lsm_offline_recorder.py' para generar datos primero.")
+        return None
+
+    data_list = []
+    try:
+        with open(DICTIONARY_FILE, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    # Cada línea es un objeto JSON que contiene sign_name, difficulty y vector
+                    data_list.append(json.loads(line))
+        
+        print(f"✅ Datos cargados: {len(data_list)} registros encontrados en '{DICTIONARY_FILE}'.")
+        return data_list
+    
+    except json.JSONDecodeError as e:
+        print(f"❌ ERROR: El archivo '{DICTIONARY_FILE}' contiene JSON inválido en la línea. {e}")
+        return None
+    except Exception as e:
+        print(f"❌ Error al leer el archivo de datos: {e}")
+        return None
+
 
 # --- FUNCIÓN DE INICIALIZACIÓN ---
 
 def initialize_qdrant_collection():
     """
-    Se conecta a Qdrant, elimina la colección y la recrea con el esquema de 60D.
+    Se conecta a Qdrant, elimina la colección, la recrea con 60D y carga los datos del TXT.
     """
     print(f"Intentando conectar a Qdrant en {QDRANT_HOST}:{QDRANT_PORT}...")
     
+    # Cargar los datos del archivo de texto primero
+    raw_data_points = load_data_from_txt()
+    if raw_data_points is None or not raw_data_points:
+        return # Salir si no hay datos válidos
+
     client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
     
     try:
@@ -64,34 +88,22 @@ def initialize_qdrant_collection():
         )
         print("Colección creada con éxito.")
         
-        # 4. Preparar y insertar los puntos (Maneja ambos formatos: simple y anidado)
+        # 4. Preparar e insertar los puntos desde el archivo TXT
         points = []
-        point_id_counter = 0
-
-        for sign_name, data in MOCK_SIGNS_RAW.items():
+        for data in raw_data_points:
+            # Usamos el 'id' del registro (aunque sea simple)
+            point_id = data.get("id")
             
-            # --- LÓGICA DE UNIFICACIÓN DE ESTRUCTURA ---
-            if 'payload' in data:
-                # Caso de estructura anidada (como "AZUL")
-                vector_data = data['vector']
-                payload_data = data['payload']
-            else:
-                # Caso de estructura simple (como "HOLA")
-                vector_data = data['vector']
-                payload_data = {
-                    "sign_name": sign_name,
-                    "difficulty": data.get("difficulty", "MEDIO") # Usar el valor o "MEDIO" por defecto
-                }
-            # ----------------------------------------
-
             points.append(
                 models.PointStruct(
-                    id=point_id_counter,
-                    vector=vector_data,
-                    payload=payload_data 
+                    id=point_id,
+                    vector=data["vector"],
+                    payload={
+                        "sign_name": data["sign_name"], 
+                        "difficulty": data["difficulty"]
+                    } 
                 )
             )
-            point_id_counter += 1
 
         print(f"Insertando {len(points)} puntos de referencia...")
         
@@ -112,7 +124,7 @@ def initialize_qdrant_collection():
         print(f"✅ Inicialización de Qdrant completa. Total de puntos: {client.count(collection_name=COLLECTION_NAME, exact=True).count}")
 
     except Exception as e:
-        print(f"❌ Error al inicializar la colección de Qdrant. Asegúrate de que el contenedor esté corriendo y el puerto 6333 esté libre.")
+        print(f"❌ Error al inicializar la colección de Qdrant. Asegúrate de que el contenedor esté corriendo.")
         print(f"ERROR: {e}")
 
 if __name__ == "__main__":
