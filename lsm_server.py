@@ -12,6 +12,8 @@ from qdrant_client.http.exceptions import UnexpectedResponse
 QDRANT_HOST = "localhost" # Usar "qdrant" si usas Docker Compose
 QDRANT_PORT = 6333
 QDRANT_COLLECTION = "lsm_signs"
+
+SOCKET_IP = "0.0.0.0"
 PORT = 7777 # Usando el puerto que especificaste
 
 # Inicializar MediaPipe Hand Solutions
@@ -223,9 +225,9 @@ async def main():
     except Exception as e:
         print(f"❌ ADVERTENCIA: No se pudo conectar a Qdrant en {QDRANT_HOST}:{QDRANT_PORT}. El servidor iniciará, pero las validaciones fallarán. Error: {e}")
         
-    async with websockets.serve(process_player_image, "0.0.0.0", PORT):
+    async with websockets.serve(process_player_image, SOCKET_IP, PORT):
         print("-------------------------------------------------------")
-        print(f"Servidor WebSocket LSM iniciado en ws://0.0.0.0:{PORT}")
+        print(f"Servidor WebSocket LSM iniciado en ws://{SOCKET_IP}:{PORT}")
         print("-------------------------------------------------------")
         await asyncio.Future()
 

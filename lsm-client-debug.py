@@ -11,7 +11,7 @@ from PIL import Image, ImageTk
 # --- CONFIGURACIÓN DEL CLIENTE ---
 # Asegúrate de que el puerto coincida con lsm_server.py
 WEBSOCKET_URL = "ws://localhost:7777"
-CAMERA_INDEX = 1
+CAMERA_INDEX = 0
 FPS_LIMIT = 15 # Limitar el envío a aproximadamente 15 frames por segundo
 FRAME_INTERVAL_MS = int(1000 / FPS_LIMIT)
 
