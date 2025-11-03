@@ -7,13 +7,20 @@ import asyncio
 import json
 import base64
 from PIL import Image, ImageTk
+import threading
 
 # --- CONFIGURACIÓN DEL CLIENTE ---
-# Asegúrate de que el puerto coincida con lsm_server.py
 WEBSOCKET_URL = "ws://localhost:7777"
-CAMERA_INDEX = 0
-FPS_LIMIT = 15 # Limitar el envío a aproximadamente 15 frames por segundo
+# Usar 0 si es la cámara por defecto, o el índice correcto
+CAMERA_INDEX = 1
+FPS_LIMIT = 15 
 FRAME_INTERVAL_MS = int(1000 / FPS_LIMIT)
+
+# Lista de señas de prueba (simula los sign_name de tu colección Qdrant)
+TARGET_SIGNS_LIST = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "L", "M", "N", "O", "R", "S", "T", "U", "V", "W" ,"Y"] 
+
+# Usamos una variable global para el loop de asyncio que se ejecuta en el hilo secundario
+GLOBAL_ASYNC_LOOP = None 
 
 class GameClientApp:
     def __init__(self, master):
@@ -24,8 +31,15 @@ class GameClientApp:
         self.ws_connected = False
         self.websocket = None
         
+        # Estado del índice de seña
+        self.sign_index = -1 
+        
         # Cámara
         self.cap = cv2.VideoCapture(CAMERA_INDEX)
+        if not self.cap.isOpened():
+             messagebox.showerror("Error de Cámara", "No se pudo abrir la cámara.")
+             master.destroy()
+             return
         
         # --- UI ELEMENTS ---
         self.master.geometry("750x600")
@@ -48,8 +62,8 @@ class GameClientApp:
         self.result_label = tk.Label(master, text="Esperando Seña...", fg="blue", font=("Arial", 18, "bold"))
         self.result_label.pack(pady=10)
 
-        # 5. Botón de Control (Ejemplo: Obtener nuevo objetivo)
-        self.target_button = tk.Button(master, text="Solicitar Seña 'A'", command=lambda: self.send_command('SET_TARGET', 'A'))
+        # 5. Botón de Control (Avance de Índice)
+        self.target_button = tk.Button(master, text="INICIAR (Siguiente Seña)", command=self.advance_sign_index, bg="#4CAF50", fg="white", font=("Arial", 12))
         self.target_button.pack(pady=10)
         
         # Iniciar la conexión WebSocket
@@ -57,37 +71,73 @@ class GameClientApp:
         # Iniciar el bucle de la cámara
         self.update_frame()
 
+    def advance_sign_index(self):
+        """Avanza al siguiente índice de seña y envía el nuevo SET_TARGET."""
+        
+        self.sign_index = (self.sign_index + 1) % len(TARGET_SIGNS_LIST)
+        next_sign = TARGET_SIGNS_LIST[self.sign_index]
+        
+        self.target_button.config(text=f"Siguiente Seña: {next_sign} (Índice: {self.sign_index})")
+        
+        # Enviar el comando al servidor
+        self.send_command('SET_TARGET', next_sign)
+
     # ---------------------------------
     # --- CONEXIÓN Y RECEPCIÓN WS ---
     # ---------------------------------
 
     def start_websocket(self):
-        """Inicia el cliente WebSocket de forma asíncrona."""
-        asyncio.run_coroutine_threadsafe(self.connect_and_receive(), asyncio.get_event_loop())
+        """Inicia el cliente WebSocket de forma asíncrona usando el loop global."""
+        # Se asegura que la corutina se ejecute en el hilo secundario (ASYNC_LOOP)
+        if GLOBAL_ASYNC_LOOP and not GLOBAL_ASYNC_LOOP.is_running():
+             # Si el loop no está corriendo, intentamos iniciarlo
+             threading.Thread(target=self._run_connect, daemon=True).start()
+        elif GLOBAL_ASYNC_LOOP:
+             # Si el loop ya está corriendo, programamos la conexión
+             asyncio.run_coroutine_threadsafe(self.connect_and_receive(), GLOBAL_ASYNC_LOOP)
+
+    def _run_connect(self):
+        """Función síncrona helper para ejecutar connect_and_receive en el hilo."""
+        global GLOBAL_ASYNC_LOOP
+        if GLOBAL_ASYNC_LOOP and GLOBAL_ASYNC_LOOP.is_running():
+            asyncio.run_coroutine_threadsafe(self.connect_and_receive(), GLOBAL_ASYNC_LOOP)
+        else:
+             # Si el hilo no está listo, intentamos de nuevo en un momento
+             self.master.after(500, self.start_websocket)
+
 
     async def connect_and_receive(self):
         """Maneja la conexión y el bucle de recepción de datos."""
-        try:
-            # Intentar conectar
-            self.websocket = await websockets.connect(WEBSOCKET_URL)
-            self.ws_connected = True
-            self.conn_label.config(text=f"Conectado a {WEBSOCKET_URL}", fg="green")
-            
-            # Enviar el primer comando para obtener un objetivo por defecto
-            await self.send_command_async('SET_TARGET', 'HOLA')
+        
+        # Bucle para reintentar la conexión de manera persistente
+        while True:
+            try:
+                # Intentar conectar
+                self.websocket = await websockets.connect(WEBSOCKET_URL)
+                self.ws_connected = True
+                self.master.after(0, lambda: self.conn_label.config(text=f"Conectado a {WEBSOCKET_URL}", fg="green"))
+                print(f"WS Cliente: Conexión exitosa a {WEBSOCKET_URL}")
+                
+                # Al conectar, solicitar el primer objetivo
+                self.advance_sign_index() 
 
-            # Bucle de Recepción: Escuchar continuamente las respuestas del servidor
-            while self.ws_connected:
-                message = await self.websocket.recv()
-                self.process_server_response(message)
+                # Bucle de Recepción: Escuchar continuamente las respuestas
+                while self.ws_connected:
+                    message = await self.websocket.recv()
+                    # Ejecutar la actualización de la UI en el hilo principal de Tkinter
+                    self.master.after(0, lambda m=message: self.process_server_response(m))
 
-        except ConnectionRefusedError:
-            self.conn_label.config(text="ERROR: Conexión rechazada (Servidor inactivo)", fg="red")
-        except Exception as e:
-            self.conn_label.config(text=f"ERROR de conexión WS: {e}", fg="red")
-        finally:
-            self.ws_connected = False
-            self.websocket = None
+            except ConnectionRefusedError:
+                self.master.after(0, lambda: self.conn_label.config(text="ERROR: Conexión rechazada (Servidor inactivo)", fg="red"))
+                await asyncio.sleep(3) # Esperar antes de reintentar
+            except Exception as e:
+                self.master.after(0, lambda: self.conn_label.config(text=f"ERROR de conexión WS: {e}", fg="red"))
+                print(f"WS Cliente: Error en bucle de recepción: {e}")
+                await asyncio.sleep(3) # Esperar antes de reintentar
+            finally:
+                self.ws_connected = False
+                self.websocket = None
+
 
     def process_server_response(self, message):
         """Actualiza la interfaz con la respuesta del lsm_server."""
@@ -95,19 +145,21 @@ class GameClientApp:
             response = json.loads(message)
 
             if response.get("status") == "NEW_TARGET" or response.get("status") == "TARGET_SET":
-                # Si el servidor establece un nuevo objetivo
-                self.target_label.config(text=f"Objetivo Actual: {response.get('target')}", fg="black")
+                target = response.get('target', '(Desconocido)')
+                self.target_label.config(text=f"Objetivo Actual: {target}", fg="black")
                 self.result_label.config(text="¡Haz la Seña!", fg="blue")
 
             elif "result" in response:
-                # Si el servidor envía un resultado de validación
                 is_correct = response["result"]
                 feedback = response.get("feedback", "Procesando...")
+                target = response.get('target', '(Error)')
                 
                 if is_correct:
                     self.result_label.config(text=f"✅ ¡CORRECTO! ({feedback})", fg="green")
                 else:
                     self.result_label.config(text=f"❌ INCORRECTO: {feedback}", fg="red")
+                    
+                self.target_label.config(text=f"Objetivo: {target}", fg="black")
 
         except json.JSONDecodeError:
             print("Error al decodificar la respuesta JSON.")
@@ -120,11 +172,11 @@ class GameClientApp:
 
     def send_command(self, command, sign):
         """Función síncrona para enviar comandos desde la UI (Botón)."""
-        if self.ws_connected:
-            asyncio.run_coroutine_threadsafe(self.send_command_async(command, sign), asyncio.get_event_loop())
+        # Usamos el loop global
+        if self.ws_connected and GLOBAL_ASYNC_LOOP:
+            asyncio.run_coroutine_threadsafe(self.send_command_async(command, sign), GLOBAL_ASYNC_LOOP)
         else:
-            self.conn_label.config(text="¡Desconectado! Reintentando...", fg="red")
-            self.start_websocket()
+            self.conn_label.config(text="¡Desconectado! Intentando reconexión automática...", fg="red")
 
     async def send_command_async(self, command, sign):
         """Envía un comando de control (ej. SET_TARGET) al servidor."""
@@ -146,19 +198,15 @@ class GameClientApp:
         """Bucle principal para la cámara y el envío de datos."""
         ret, frame = self.cap.read()
         if ret:
-            # Invertir el frame para el efecto espejo de la webcam
             frame = cv2.flip(frame, 1)
             
-            # 1. Procesar y enviar el frame al servidor (solo si está conectado)
-            if self.ws_connected:
-                # Codificar el frame a JPEG o PNG y luego a Base64
-                _, buffer = cv2.imencode('.jpeg', frame, [cv2.IMWRITE_JPEG_QUALITY, 50]) # Compresión para velocidad
+            if self.ws_connected and GLOBAL_ASYNC_LOOP:
+                # Ejecutar el envío de datos en el loop asíncrono
+                _, buffer = cv2.imencode('.jpeg', frame, [cv2.IMWRITE_JPEG_QUALITY, 50]) 
                 base64_data = base64.b64encode(buffer)
                 
-                # Enviar de forma asíncrona
-                asyncio.run_coroutine_threadsafe(self.send_frame_data(base64_data), asyncio.get_event_loop())
+                asyncio.run_coroutine_threadsafe(self.send_frame_data(base64_data), GLOBAL_ASYNC_LOOP)
 
-            # 2. Actualizar la UI (Dibujar en Tkinter)
             cv2image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGBA)
             img = Image.fromarray(cv2image)
             img = img.resize((640, 480), Image.Resampling.LANCZOS)
@@ -167,45 +215,49 @@ class GameClientApp:
             self.video_label.imgtk = imgtk
             self.video_label.configure(image=imgtk)
             
-        # Repetir el bucle con un retraso (controla los FPS de la UI y el envío)
         self.master.after(FRAME_INTERVAL_MS, self.update_frame)
 
 def main():
-    # Configurar el bucle de eventos de asyncio para Tkinter
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+    global GLOBAL_ASYNC_LOOP
 
-    def run_tk(root, loop):
-        """Corre el bucle de Tkinter y el bucle de eventos de asyncio en paralelo."""
-        try:
-            root.mainloop()
-        finally:
-            loop.stop()
+    # 1. Configurar el bucle de eventos de asyncio para el hilo secundario
+    try:
+        GLOBAL_ASYNC_LOOP = asyncio.get_running_loop()
+    except RuntimeError:
+        GLOBAL_ASYNC_LOOP = asyncio.new_event_loop()
+        asyncio.set_event_loop(GLOBAL_ASYNC_LOOP)
 
     def run_asyncio(loop):
-        """Corre el bucle de eventos de asyncio."""
+        """Corre el bucle de eventos de asyncio en el hilo secundario."""
+        print("ASYNCIO: Loop iniciado en hilo secundario.")
         loop.run_forever()
 
+    # 2. Iniciar el loop de asyncio en un hilo separado
+    threading.Thread(target=lambda: run_asyncio(GLOBAL_ASYNC_LOOP), daemon=True).start()
+    
+    # 3. Iniciar la aplicación Tkinter en el hilo principal
     root = tk.Tk()
     app = GameClientApp(root)
 
-    # Configurar el cierre de la ventana
+    # 4. Configurar el cierre de la ventana
     def on_closing():
         if app.cap.isOpened():
             app.cap.release()
         if app.websocket:
-            asyncio.run_coroutine_threadsafe(app.websocket.close(), loop)
+            # Cerrar el websocket de forma asíncrona y luego detener el loop
+            try:
+                future = asyncio.run_coroutine_threadsafe(app.websocket.close(), GLOBAL_ASYNC_LOOP)
+                future.result(timeout=1)
+            except:
+                pass
+        
+        # Detener el loop de asyncio y la aplicación Tkinter
+        GLOBAL_ASYNC_LOOP.call_soon_threadsafe(GLOBAL_ASYNC_LOOP.stop)
         root.destroy()
         
     root.protocol("WM_DELETE_WINDOW", on_closing)
 
-    # Ejecutar Tkinter en el hilo principal y asyncio en un hilo separado
-    import threading
-    threading.Thread(target=lambda: run_asyncio(loop), daemon=True).start()
-    run_tk(root, loop)
+    root.mainloop()
 
 if __name__ == "__main__":
     main()

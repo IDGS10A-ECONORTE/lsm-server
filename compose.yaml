@@ -7,12 +7,11 @@ services:
     container_name: lsm-server
     ports:
       - 7777:7777
-    volumes:
-      - ./:/python
     depends_on: 
     - qdrant
     environment:
-      - QDRANT_URL=http://qdrant:6333
+       QDRANT_HOST: qdrant
+       QDRANT_PORT: 6333
   qdrant:
     image: qdrant/qdrant:latest
     container_name: qdrant_db

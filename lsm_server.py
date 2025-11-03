@@ -4,13 +4,14 @@ import json
 import base64
 import numpy as np
 import cv2
+import os
 import mediapipe as mp
 from qdrant_client import QdrantClient, models
 from qdrant_client.http.exceptions import UnexpectedResponse
 
 # --- CONFIGURACIÓN GLOBAL ---
-QDRANT_HOST = "localhost" # Usar "qdrant" si usas Docker Compose
-QDRANT_PORT = 6333
+QDRANT_HOST = os.environ.get("QDRANT_HOST", "localhost")
+QDRANT_PORT = int(os.environ.get("QDRANT_PORT", "6333"))
 QDRANT_COLLECTION = "lsm_signs"
 
 SOCKET_IP = "0.0.0.0"
