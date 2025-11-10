@@ -7,7 +7,17 @@ services:
     volumes:
       - qdrant_storage:/qdrant/storage
     restart: unless-stopped
-
+  mongodb:
+    image: mongo:7
+    container_name: mongodb
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: lsmarena
+      MONGO_INITDB_ROOT_PASSWORD: admin123
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
   lsm-server:
     build:
       context: .
@@ -21,8 +31,11 @@ services:
     environment:
        QDRANT_HOST: qdrant
        QDRANT_PORT: 6333
+       MONGO_HOST: mongodb
+       MONGO_PORT: 27017
     restart: unless-stopped
     command: ["bash", "-c", "python3 qdrant_init.py && python3 lsm_server.py"]
 
 volumes:
   qdrant_storage:
+  mongo_data:

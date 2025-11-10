@@ -15,7 +15,7 @@ QDRANT_PORT = int(os.environ.get("QDRANT_PORT", "6333"))
 QDRANT_COLLECTION = "lsm_signs"
 
 SOCKET_IP = "0.0.0.0"
-PORT = 7777 # Usando el puerto que especificaste
+PORT = 7777 # Puerto del WebSocket
 
 # Inicializar MediaPipe Hand Solutions
 mp_hands = mp.solutions.hands
@@ -38,61 +38,77 @@ CONNECTED_PLAYERS = {}
 
 def get_normalized_hand_vector(results):
     """
-    Procesa los resultados de MediaPipe para crear un vector de 60 dimensiones (X, Y, Z normalizados).
-    Aplica: Centrado, Escalado por Tamaño (Distancia L0-L9), y Mirroring (Reflexión en X).
+    Procesa los resultados de MediaPipe para normalizar la mano detectada
+    y crear un vector de 60 dimensiones (20 landmarks * 3 coordenadas).
+    
+    Retorna (hand_vector_60d, handedness)
     """
-    if not results.multi_hand_landmarks or not results.multi_handedness:
+    if not results.multi_hand_landmarks:
         return None, None
 
-    # Asumimos una sola mano para el vector
-    landmarks = results.multi_hand_landmarks[0].landmark
-    handedness = results.multi_handedness[0].classification[0].label # 'Left' o 'Right'
-
-    # 1. Centrado (Traslación): Usamos la muñeca (L0) como origen.
-    wrist = landmarks[0]
-    relative_landmarks = []
-    for lm in landmarks:
-        # Calcular coordenadas relativas (X', Y', Z')
-        relative_landmarks.append((lm.x - wrist.x, lm.y - wrist.y, lm.z - wrist.z))
-
-    # 2. Escalado (Ajuste de Tamaño): Distancia L0 a L9 (base del dedo corazón).
-    l9 = relative_landmarks[9]
-    d_ref = np.sqrt(l9[0]**2 + l9[1]**2 + l9[2]**2)
+    # Asumimos una sola mano (max_num_hands=1 en la configuración)
+    hand_landmarks = results.multi_hand_landmarks[0]
     
-    # Manejar caso de división por cero (ej. mano muy cerca o detección pobre)
-    if d_ref < 1e-6: 
-        return None, None
-        
-    final_vector = []
+    # 1. Obtener los 21 puntos (x, y, z)
+    points = []
+    for landmark in hand_landmarks.landmark:
+        points.extend([landmark.x, landmark.y, landmark.z])
+
+    # El vector inicial es de 63 dimensiones (21 * 3)
+    vector_63d = np.array(points, dtype=np.float32)
+
+    # 2. Normalización de Traslación (Centrado en la Muñeca)
+    # El punto 0 es la muñeca (wrist)
+    wrist_x, wrist_y, wrist_z = vector_63d[0], vector_63d[1], vector_63d[2]
     
-    # 3. Escalado y Reflexión (Mirroring)
-    # Iteramos desde L1 hasta L20 (excluyendo L0 - muñeca)
-    for i in range(1, 21): 
-        x_prime, y_prime, z_prime = relative_landmarks[i]
+    # Restar las coordenadas de la muñeca a todos los puntos (X, Y, Z)
+    for i in range(0, 63, 3):
+        vector_63d[i] -= wrist_x    # X
+        vector_63d[i+1] -= wrist_y  # Y
+        vector_63d[i+2] -= wrist_z  # Z
 
-        x_scaled = x_prime / d_ref
-        y_scaled = y_prime / d_ref
-        z_scaled = z_prime / d_ref
-        
-        # Aplicar Mirroring (Reflexión en X para mano izquierda - zurdos)
-        if handedness == 'Left':
-            x_scaled *= -1
-            
-        final_vector.extend([x_scaled, y_scaled, z_scaled])
+    # 3. Normalización de Escala (Dividir por la distancia de la muñeca al dedo medio)
+    # Usamos el punto 9 (MCP del Dedo Medio) para escala
+    # vector_63d[27], [28], [29] son X, Y, Z del punto 9 (índices 27-29)
+    # Nota: Como ya están centrados, son las distancias respecto a la muñeca.
+    scale_factor = np.linalg.norm(vector_63d[27:30])
+    
+    # Prevenir división por cero si la mano está colapsada o no se detectó bien
+    if scale_factor < 1e-6:
+        return None, None 
 
-    # El vector final es de 20 landmarks * 3 coordenadas = 60 dimensiones.
-    return final_vector, handedness
+    # Aplicar el factor de escala a todos los puntos, excepto la muñeca (ya es [0,0,0])
+    vector_63d /= scale_factor
+    
+    # 4. Eliminar el punto de la Muñeca (es [0,0,0] después de la normalización)
+    # El vector final es de 60 dimensiones (20 * 3)
+    hand_vector_60d = vector_63d[3:] 
+
+    # 5. Determinar la lateralidad (handedness)
+    handedness = results.multi_handedness[0].classification[0].label
+    
+    handedness = results.multi_handedness[0].classification[0].label
+    
+    if handedness == 'Left':
+        # Reflejar el eje X (cada tercer elemento, empezando por el primero)
+        # Esto convierte la seña zurda a la perspectiva diestra
+        for i in range(0, len(hand_vector_60d), 3):
+            hand_vector_60d[i] *= -1
+
+    return hand_vector_60d.tolist(), handedness
 
 # ----------------------------------------------------------------------
-# LÓGICA DE VALIDACIÓN DE QDRANT
+# FUNCIONES DE VALIDACIÓN Y BÚSQUEDA QDRANT (MODIFICADA)
 # ----------------------------------------------------------------------
 
 def validate_sign_against_qdrant(vector, target_sign):
     """
     Busca el vector normalizado en Qdrant para validar si es el signo objetivo.
+    
+    Retorna (is_correct, feedback_message, score_percentage).
     """
     if vector is None or target_sign is None:
-        return False, "Error de procesamiento o no hay objetivo."
+        return False, "Error de procesamiento o no hay objetivo.", 0.0
     
     try:
         # 1. Definir el filtro (solo buscar el signo objetivo actual)
@@ -114,98 +130,144 @@ def validate_sign_against_qdrant(vector, target_sign):
         )
 
         # 3. Evaluación del Resultado
-        # Nota: Puedes ajustar el umbral 0.80 (80%) según la precisión de tu entrenamiento
-        if search_result and search_result[0].score > 0.80: 
+        score = search_result[0].score if search_result else 0.0
+        # Convertir el score (coseno de similitud, de 0 a 1) a porcentaje
+        score_percent = score * 100.0 
+        
+        # Nota: Ajusta el umbral 0.80 (80%) según la precisión de tu entrenamiento
+        # Si no hay resultados de búsqueda, score es 0.0
+        if score > 0.98: 
             # La seña más cercana del target deseado tiene una alta similitud
-            return True, f"¡Seña Correcta! Similitud: {search_result[0].score:.2f}"
+            return True, f"¡Seña Correcta! Similitud: {score_percent:.1f}%", score_percent
         else:
             # No se encontró una coincidencia con el umbral de similitud
-            return False, "Seña incorrecta o similitud insuficiente."
+            return False, f"Similitud Insuficiente: {score_percent:.1f}%", score_percent
 
     except UnexpectedResponse as e:
         print(f"Error Qdrant (Colección): {e}")
-        return False, f"Error Qdrant: Colección '{QDRANT_COLLECTION}' no lista o dimensiones incorrectas."
+        return False, f"Error Qdrant: Colección '{QDRANT_COLLECTION}' no lista.", 0.0
     except Exception as e:
         print(f"Error grave en la consulta a Qdrant: {e}")
-        return False, "Error interno del servidor al consultar DB."
+        return False, "Error interno del servidor al consultar DB.", 0.0
 
 # ----------------------------------------------------------------------
-# BUCLE PRINCIPAL DEL WEBSOCKET (Manejo de Conexión y Datos)
+# BUCLE PRINCIPAL DEL WEBSOCKET (MODIFICADA)
 # ----------------------------------------------------------------------
 
 async def process_player_image(websocket):
-    """Maneja la conexión de un jugador y el ciclo de juego."""
+    """
+    Maneja la conexión WebSocket y procesa los mensajes del cliente.
+    """
+    player_id = hex(id(websocket))
+    CONNECTED_PLAYERS[websocket] = {"id": player_id, "target_sign": "NONE"}
+    print(f"[Conexión] Nuevo jugador {player_id} conectado.")
     
-    player_id = len(CONNECTED_PLAYERS) + 1
-    CONNECTED_PLAYERS[websocket] = {'player_id': player_id, 'target_sign': 'A', 'is_active': True}
-    print(f"[Conexión] Jugador {player_id} conectado.")
-    
-    try:
-        # Envía el estado inicial al cliente
-        await websocket.send(json.dumps({
-            "status": "CONNECTED", 
-            "player_id": player_id, 
-            "target": CONNECTED_PLAYERS[websocket]['target_sign'],
-            "message": "Esperando comandos o imágenes..."
-        }))
+    # Enviar mensaje de bienvenida con ID al nuevo cliente
+    await websocket.send(json.dumps({
+        "status": "CONNECTED",
+        "player_id": player_id,
+        "message": f"Conexión establecida. ID: {player_id}"
+    }))
 
+    try:
         async for message in websocket:
-            
-            # Intento de deserialización del mensaje JSON
             try:
                 data = json.loads(message)
             except json.JSONDecodeError:
-                print(f"Error JSON de Jugador {player_id}. Mensaje descartado.")
+                print(f"Error JSON de {player_id}")
                 continue
 
-            # 1. COMANDO DE CONTROL
-            if data.get('command') == 'SET_TARGET':
-                new_target = data.get('sign', 'A').upper()
+            # Persistir player_id enviado por el cliente, si existe
+            if 'player_id' in data:
+                CONNECTED_PLAYERS[websocket]['id'] = data['player_id']
+                player_id = data['player_id']
+
+            # 1. MENSAJE DE CONFIGURACIÓN (Establecer nuevo objetivo de seña)
+            if (
+                data.get('type') == 'set_target' and 'sign' in data
+            ) or (
+                data.get('command', '').upper() == 'SET_TARGET' and 'sign' in data
+            ):
+                new_target = str(data['sign']).upper()
                 CONNECTED_PLAYERS[websocket]['target_sign'] = new_target
-                print(f"Jugador {player_id}: Objetivo establecido: {new_target}")
+                print(f"[Juego] Jugador {player_id} objetivo fijado a: {new_target}")
                 
-                await websocket.send(json.dumps({"status": "TARGET_SET", "target": new_target}))
-                continue
-            
+                # Respuesta al cliente
+                await websocket.send(json.dumps({
+                    "status": "TARGET_SET",
+                    "target": new_target,
+                }))
+
             # 2. PROCESAMIENTO DE IMAGEN (Ciclo de juego)
             elif data.get('type') == 'image' and CONNECTED_PLAYERS[websocket]['target_sign'] != 'NONE':
                 
                 is_correct = False
                 feedback = "Señal no detectada o error de procesamiento."
                 target_sign = CONNECTED_PLAYERS[websocket]['target_sign']
+                score_percent = 0.0 # <--- Nueva variable para el score
 
                 # Bloque try/except para el procesamiento de imagen
                 try:
-                    # Deserialización y decodificación
-                    img_bytes = base64.b64decode(data['image_data'])
+                    # Decodificación de la imagen de base64 a un frame de OpenCV
+                    encoded_image = data.get('image_data') or data.get('data')
+                    if not encoded_image:
+                        raise ValueError("Mensaje de imagen sin datos.")
+
+                    # Aceptar datos enviados ya en bytes (latin1) o en base64
+                    if isinstance(encoded_image, str):
+                        img_bytes = base64.b64decode(encoded_image.encode('utf-8'))
+                    else:
+                        img_bytes = base64.b64decode(encoded_image)
+
                     np_arr = np.frombuffer(img_bytes, np.uint8)
                     frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
 
-                    # Verificar validez de la imagen
-                    if frame is None or frame.size == 0:
-                        feedback = "Error de decodificación (Frame nulo o incompleto)."
-                    else:
-                        # Procesar y obtener el vector 60D
-                        results = hands.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                    if frame is None:
+                        raise ValueError("No se pudo decodificar el frame de la imagen.")
                     
-                        hand_vector, handedness = get_normalized_hand_vector(results)
+                    # Procesar y obtener el vector 60D
+                    # MediaPipe trabaja en RGB, cv2 por defecto está en BGR
+                    results = hands.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                    
+                    hand_vector, handedness = get_normalized_hand_vector(results)
 
-                        # Validar contra Qdrant
-                        is_correct, feedback = validate_sign_against_qdrant(hand_vector, target_sign)
-
+                    # Si se detectó una mano, validar contra Qdrant y OBTENER EL SCORE
+                    if hand_vector:
+                        is_correct, feedback, score_percent = validate_sign_against_qdrant(hand_vector, target_sign)
+                    else:
+                        feedback = "Mano no detectada por MediaPipe."
+                        
                 except Exception as proc_e:
-                    # Capturar cualquier fallo de procesamiento (ej. MediaPipe/Numpy/CV)
-                    print(f"ERROR DE PROCESAMIENTO JUGADOR {player_id}: {proc_e.__class__.__name__}")
+                    # Manejo de errores durante el procesamiento (decodificación, MediaPipe)
+                    print(f"Error de procesamiento de imagen en {player_id}: {proc_e}")
                     feedback = f"Error de Visión: {proc_e.__class__.__name__}"
 
 
-                # 3. RESPONDER AL CLIENTE (Movido fuera del try/except anidado)
+                # 3. RESPONDER AL CLIENTE
                 await websocket.send(json.dumps({
                     "result": is_correct,
                     "feedback": feedback,
                     "target": target_sign,
+                    "score": score_percent, # <--- ENVIAR EL SCORE AL CLIENTE
+                }))
+
+            # 4. MENSAJE DE PAUSA/INACTIVIDAD (Detener el juego)
+            elif data.get('type') == 'stop_target' or data.get('command', '').upper() == 'STOP_TARGET':
+                CONNECTED_PLAYERS[websocket]['target_sign'] = 'NONE'
+                print(f"[Juego] Jugador {player_id} objetivo detenido.")
+                
+                await websocket.send(json.dumps({
+                    "status": "TARGET_STOPPED",
+                    "target": "NONE",
                 }))
             
+            # Otros tipos de mensajes no definidos
+            else:
+                await websocket.send(json.dumps({
+                    "status": "UNKNOWN_COMMAND",
+                    "message": "Comando no reconocido o target no fijado."
+                }))
+
     except websockets.exceptions.ConnectionClosedOK:
         print(f"[Desconexión] Jugador {player_id} desconectado limpiamente.")
     except Exception as e:
@@ -230,7 +292,8 @@ async def main():
         print("-------------------------------------------------------")
         print(f"Servidor WebSocket LSM iniciado en ws://{SOCKET_IP}:{PORT}")
         print("-------------------------------------------------------")
-        await asyncio.Future()
+        await asyncio.Future() # Mantiene el servidor en ejecución
+
 
 if __name__ == "__main__":
     try:
@@ -238,4 +301,4 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\nServidor detenido por el usuario.")
     except Exception as e:
-        print(f"El servidor falló al iniciar: {e}")
+        print(f"\nError en la ejecución principal: {e}")
