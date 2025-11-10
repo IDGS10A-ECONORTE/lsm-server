@@ -18,6 +18,8 @@ SOCKET_IP = "0.0.0.0"
 PORT = 7777 # Puerto del WebSocket
 
 # Inicializar MediaPipe Hand Solutions
+# **IMPORTANTE:** El objeto 'hands' se inicializa solo una vez y es thread-safe para uso en diferentes llamadas
+# SÍ es necesario llamar a process() secuencialmente DENTRO de un hilo (como haremos con run_in_executor).
 mp_hands = mp.solutions.hands
 hands = mp_hands.Hands(
     static_image_mode=False,
@@ -87,8 +89,6 @@ def get_normalized_hand_vector(results):
     # 5. Determinar la lateralidad (handedness)
     handedness = results.multi_handedness[0].classification[0].label
     
-    handedness = results.multi_handedness[0].classification[0].label
-    
     if handedness == 'Left':
         # Reflejar el eje X (cada tercer elemento, empezando por el primero)
         # Esto convierte la seña zurda a la perspectiva diestra
@@ -98,7 +98,7 @@ def get_normalized_hand_vector(results):
     return hand_vector_60d.tolist(), handedness
 
 # ----------------------------------------------------------------------
-# FUNCIONES DE VALIDACIÓN Y BÚSQUEDA QDRANT (MODIFICADA)
+# FUNCIONES DE VALIDACIÓN Y BÚSQUEDA QDRANT
 # ----------------------------------------------------------------------
 
 def validate_sign_against_qdrant(vector, target_sign):
@@ -122,6 +122,7 @@ def validate_sign_against_qdrant(vector, target_sign):
         )
         
         # 2. Búsqueda de Vecinos Más Cercanos Aproximados (ANN)
+        # Qdrant Client (qdrant_client) es thread-safe y bloqueante (por defecto HTTP)
         search_result = qdrant_client.search(
             collection_name=QDRANT_COLLECTION,
             query_vector=vector,
@@ -134,16 +135,14 @@ def validate_sign_against_qdrant(vector, target_sign):
         # Convertir el score (coseno de similitud, de 0 a 1) a porcentaje
         score_percent = score * 100.0 
         
-        # Nota: Ajusta el umbral 0.80 (80%) según la precisión de tu entrenamiento
-        # Si no hay resultados de búsqueda, score es 0.0
+        # Umbral (ajustar si es necesario)
         if score > 0.98: 
-            # La seña más cercana del target deseado tiene una alta similitud
             return True, f"¡Seña Correcta! Similitud: {score_percent:.1f}%", score_percent
         else:
-            # No se encontró una coincidencia con el umbral de similitud
             return False, f"Similitud Insuficiente: {score_percent:.1f}%", score_percent
 
     except UnexpectedResponse as e:
+        # Esto ocurre si la colección no existe o hay un error de conexión/servidor
         print(f"Error Qdrant (Colección): {e}")
         return False, f"Error Qdrant: Colección '{QDRANT_COLLECTION}' no lista.", 0.0
     except Exception as e:
@@ -151,16 +150,61 @@ def validate_sign_against_qdrant(vector, target_sign):
         return False, "Error interno del servidor al consultar DB.", 0.0
 
 # ----------------------------------------------------------------------
-# BUCLE PRINCIPAL DEL WEBSOCKET (MODIFICADA)
+# FUNCIÓN SÍNCRONA DE PROCESAMIENTO DE IMAGEN (EJECUCIÓN BLOQUEANTE)
+# ----------------------------------------------------------------------
+
+def _perform_sign_validation(image_bytes, target_sign):
+    """
+    Maneja la decodificación, el procesamiento CV/MediaPipe y la validación Qdrant.
+    Esta función es síncrona (bloqueante) y debe ejecutarse en un hilo secundario.
+    
+    Retorna: (is_correct, feedback, score_percent)
+    """
+    is_correct = False
+    feedback = "Señal no detectada o error de procesamiento."
+    score_percent = 0.0
+
+    try:
+        # Decodificación de la imagen de bytes a un frame de OpenCV
+        np_arr = np.frombuffer(image_bytes, np.uint8)
+        frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+
+        if frame is None:
+            raise ValueError("No se pudo decodificar el frame de la imagen.")
+        
+        # Procesar y obtener el vector 60D
+        # MediaPipe trabaja en RGB, cv2 por defecto está en BGR
+        results = hands.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        
+        hand_vector, handedness = get_normalized_hand_vector(results)
+
+        # Si se detectó una mano, validar contra Qdrant y OBTENER EL SCORE
+        if hand_vector:
+            is_correct, feedback, score_percent = validate_sign_against_qdrant(hand_vector, target_sign)
+        else:
+            feedback = "Mano no detectada por MediaPipe."
+            
+    except Exception as proc_e:
+        # Manejo de errores durante el procesamiento (decodificación, MediaPipe)
+        print(f"Error de procesamiento síncrono: {proc_e}")
+        feedback = f"Error de Visión: {proc_e.__class__.__name__}"
+    
+    return is_correct, feedback, score_percent
+
+# ----------------------------------------------------------------------
+# BUCLE PRINCIPAL DEL WEBSOCKET (ASÍNCRONO)
 # ----------------------------------------------------------------------
 
 async def process_player_image(websocket):
     """
-    Maneja la conexión WebSocket y procesa los mensajes del cliente.
+    Maneja la conexión WebSocket y procesa los mensajes del cliente de forma asíncrona.
     """
     player_id = hex(id(websocket))
     CONNECTED_PLAYERS[websocket] = {"id": player_id, "target_sign": "NONE"}
     print(f"[Conexión] Nuevo jugador {player_id} conectado.")
+    
+    # Referencia al loop de eventos actual para ejecutar código bloqueante
+    loop = asyncio.get_event_loop()
     
     # Enviar mensaje de bienvenida con ID al nuevo cliente
     await websocket.send(json.dumps({
@@ -171,18 +215,18 @@ async def process_player_image(websocket):
 
     try:
         async for message in websocket:
+            # La decodificación del JSON es rápida, puede hacerse de forma síncrona
             try:
                 data = json.loads(message)
             except json.JSONDecodeError:
                 print(f"Error JSON de {player_id}")
                 continue
 
-            # Persistir player_id enviado por el cliente, si existe
             if 'player_id' in data:
                 CONNECTED_PLAYERS[websocket]['id'] = data['player_id']
                 player_id = data['player_id']
 
-            # 1. MENSAJE DE CONFIGURACIÓN (Establecer nuevo objetivo de seña)
+            # 1. MENSAJE DE CONFIGURACIÓN
             if (
                 data.get('type') == 'set_target' and 'sign' in data
             ) or (
@@ -192,7 +236,6 @@ async def process_player_image(websocket):
                 CONNECTED_PLAYERS[websocket]['target_sign'] = new_target
                 print(f"[Juego] Jugador {player_id} objetivo fijado a: {new_target}")
                 
-                # Respuesta al cliente
                 await websocket.send(json.dumps({
                     "status": "TARGET_SET",
                     "target": new_target,
@@ -201,54 +244,43 @@ async def process_player_image(websocket):
             # 2. PROCESAMIENTO DE IMAGEN (Ciclo de juego)
             elif data.get('type') == 'image' and CONNECTED_PLAYERS[websocket]['target_sign'] != 'NONE':
                 
-                is_correct = False
-                feedback = "Señal no detectada o error de procesamiento."
+                # --- Preparación Asíncrona Rápida (Decodificación Base64) ---
                 target_sign = CONNECTED_PLAYERS[websocket]['target_sign']
-                score_percent = 0.0 # <--- Nueva variable para el score
-
-                # Bloque try/except para el procesamiento de imagen
+                
                 try:
-                    # Decodificación de la imagen de base64 a un frame de OpenCV
                     encoded_image = data.get('image_data') or data.get('data')
                     if not encoded_image:
                         raise ValueError("Mensaje de imagen sin datos.")
 
-                    # Aceptar datos enviados ya en bytes (latin1) o en base64
                     if isinstance(encoded_image, str):
+                        # Convertir a bytes para que sea el mismo formato que el 'else'
                         img_bytes = base64.b64decode(encoded_image.encode('utf-8'))
                     else:
                         img_bytes = base64.b64decode(encoded_image)
-
-                    np_arr = np.frombuffer(img_bytes, np.uint8)
-                    frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-
-                    if frame is None:
-                        raise ValueError("No se pudo decodificar el frame de la imagen.")
-                    
-                    # Procesar y obtener el vector 60D
-                    # MediaPipe trabaja en RGB, cv2 por defecto está en BGR
-                    results = hands.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-                    
-                    hand_vector, handedness = get_normalized_hand_vector(results)
-
-                    # Si se detectó una mano, validar contra Qdrant y OBTENER EL SCORE
-                    if hand_vector:
-                        is_correct, feedback, score_percent = validate_sign_against_qdrant(hand_vector, target_sign)
-                    else:
-                        feedback = "Mano no detectada por MediaPipe."
                         
-                except Exception as proc_e:
-                    # Manejo de errores durante el procesamiento (decodificación, MediaPipe)
-                    print(f"Error de procesamiento de imagen en {player_id}: {proc_e}")
-                    feedback = f"Error de Visión: {proc_e.__class__.__name__}"
-
+                except Exception as decode_e:
+                    print(f"Error de decodificación en {player_id}: {decode_e}")
+                    feedback = f"Error de Datos: {decode_e.__class__.__name__}"
+                    await websocket.send(json.dumps({
+                        "result": False, "feedback": feedback, "target": target_sign, "score": 0.0,
+                    }))
+                    continue # Pasar al siguiente mensaje
+                    
+                # --- Ejecución Síncrona Lenta en Hilo (Desbloqueante) ---
+                # Usar None para usar el ThreadPoolExecutor por defecto de asyncio
+                is_correct, feedback, score_percent = await loop.run_in_executor(
+                    None, 
+                    _perform_sign_validation, 
+                    img_bytes, 
+                    target_sign
+                )
 
                 # 3. RESPONDER AL CLIENTE
                 await websocket.send(json.dumps({
                     "result": is_correct,
                     "feedback": feedback,
                     "target": target_sign,
-                    "score": score_percent, # <--- ENVIAR EL SCORE AL CLIENTE
+                    "score": score_percent, 
                 }))
 
             # 4. MENSAJE DE PAUSA/INACTIVIDAD (Detener el juego)
