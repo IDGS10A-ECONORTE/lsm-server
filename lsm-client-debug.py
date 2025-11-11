@@ -12,7 +12,7 @@ import threading
 # --- CONFIGURACIÓN DEL CLIENTE ---
 WEBSOCKET_URL = "ws://localhost:7777"
 # Usar 0 si es la cámara por defecto, o el índice correcto
-CAMERA_INDEX = 1
+CAMERA_INDEX = 0
 FPS_LIMIT = 15 
 FRAME_INTERVAL_MS = int(1000 / FPS_LIMIT)
 
