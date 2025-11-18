@@ -6,6 +6,7 @@ import numpy as np
 import cv2
 import os
 import mediapipe as mp
+import random # Importado para la nueva función de asignación
 from qdrant_client import QdrantClient, models
 from qdrant_client.http.exceptions import UnexpectedResponse
 
@@ -18,8 +19,6 @@ SOCKET_IP = "0.0.0.0"
 PORT = 7777 # Puerto del WebSocket
 
 # Inicializar MediaPipe Hand Solutions
-# **IMPORTANTE:** El objeto 'hands' se inicializa solo una vez y es thread-safe para uso en diferentes llamadas
-# SÍ es necesario llamar a process() secuencialmente DENTRO de un hilo (como haremos con run_in_executor).
 mp_hands = mp.solutions.hands
 hands = mp_hands.Hands(
     static_image_mode=False,
@@ -98,7 +97,74 @@ def get_normalized_hand_vector(results):
     return hand_vector_60d.tolist(), handedness
 
 # ----------------------------------------------------------------------
-# FUNCIONES DE VALIDACIÓN Y BÚSQUEDA QDRANT
+# FUNCIONES DE LÓGICA DE JUEGO (NUEVAS)
+# ----------------------------------------------------------------------
+def get_signs_by_difficulty_from_qdrant(difficulty_level):
+    """
+    Recupera una lista de 'sign_name' desde Qdrant filtrando por difficulty_level.
+    
+    Esta función es síncrona y BLOQUEANTE, pero la usaremos con run_in_executor.
+    """
+    signs = []
+    
+    # Si la dificultad es 'ANY', no aplicamos filtro
+    if difficulty_level.upper() == 'ANY':
+        query_filter = None
+    else:
+        query_filter = models.Filter(
+            must=[
+                models.FieldCondition(
+                    key="difficulty_level", 
+                    match=models.MatchValue(value=difficulty_level.upper())
+                )
+            ]
+        )
+
+    try:
+        # Usamos scroll para recuperar todos los puntos que coincidan con el filtro.
+        # Solo solicitamos los campos 'sign_name' del payload.
+        all_points, _ = qdrant_client.scroll(
+            collection_name=QDRANT_COLLECTION,
+            scroll_filter=query_filter,
+            with_payload=True,
+            limit=500, # Límite razonable para una búsqueda rápida de todos los signos
+            with_vectors=False, # No necesitamos el vector, solo el payload
+            payload_selector=models.PayloadSelectorInclude(
+                include=["sign_name"]
+            )
+        )
+
+        for point in all_points:
+            # Añadir el nombre de la seña si existe y no está ya en la lista
+            sign_name = point.payload.get("sign_name")
+            if sign_name and sign_name not in signs:
+                signs.append(sign_name)
+                
+    except Exception as e:
+        print(f"Error al consultar Qdrant para dificultad {difficulty_level}: {e}")
+        # En caso de error, retorna una lista vacía para evitar fallos.
+        return []
+
+    return signs
+
+def assign_target_sign(difficulty_level="EASY", loop=None):
+    """
+    Asigna una seña objetivo aleatoria basada en la dificultad, consultando Qdrant.
+    
+    IMPORTANTE: Si se llama de forma asíncrona, debe usarse con run_in_executor.
+    """
+    
+    # Esta función ahora es un simple wrapper que llama a la función de Qdrant.
+    signs = get_signs_by_difficulty_from_qdrant(difficulty_level)
+
+    if signs:
+        return random.choice(signs)
+    else:
+        print(f"Advertencia: No se encontraron señas para la dificultad '{difficulty_level}'.")
+        return None
+
+# ----------------------------------------------------------------------
+# FUNCIONES DE VALIDACIÓN Y BÚSQUEDA QDRANT (Umbral Ajustado)
 # ----------------------------------------------------------------------
 
 def validate_sign_against_qdrant(vector, target_sign):
@@ -122,7 +188,6 @@ def validate_sign_against_qdrant(vector, target_sign):
         )
         
         # 2. Búsqueda de Vecinos Más Cercanos Aproximados (ANN)
-        # Qdrant Client (qdrant_client) es thread-safe y bloqueante (por defecto HTTP)
         search_result = qdrant_client.search(
             collection_name=QDRANT_COLLECTION,
             query_vector=vector,
@@ -132,17 +197,15 @@ def validate_sign_against_qdrant(vector, target_sign):
 
         # 3. Evaluación del Resultado
         score = search_result[0].score if search_result else 0.0
-        # Convertir el score (coseno de similitud, de 0 a 1) a porcentaje
         score_percent = score * 100.0 
         
-        # Umbral (ajustar si es necesario)
-        if score > 0.98: 
+        # Umbral requerido: mayor a 94% (score > 0.94)
+        if score > 0.94: 
             return True, f"¡Seña Correcta! Similitud: {score_percent:.1f}%", score_percent
         else:
             return False, f"Similitud Insuficiente: {score_percent:.1f}%", score_percent
 
     except UnexpectedResponse as e:
-        # Esto ocurre si la colección no existe o hay un error de conexión/servidor
         print(f"Error Qdrant (Colección): {e}")
         return False, f"Error Qdrant: Colección '{QDRANT_COLLECTION}' no lista.", 0.0
     except Exception as e:
@@ -173,7 +236,6 @@ def _perform_sign_validation(image_bytes, target_sign):
             raise ValueError("No se pudo decodificar el frame de la imagen.")
         
         # Procesar y obtener el vector 60D
-        # MediaPipe trabaja en RGB, cv2 por defecto está en BGR
         results = hands.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
         
         hand_vector, handedness = get_normalized_hand_vector(results)
@@ -203,7 +265,6 @@ async def process_player_image(websocket):
     CONNECTED_PLAYERS[websocket] = {"id": player_id, "target_sign": "NONE"}
     print(f"[Conexión] Nuevo jugador {player_id} conectado.")
     
-    # Referencia al loop de eventos actual para ejecutar código bloqueante
     loop = asyncio.get_event_loop()
     
     # Enviar mensaje de bienvenida con ID al nuevo cliente
@@ -215,7 +276,6 @@ async def process_player_image(websocket):
 
     try:
         async for message in websocket:
-            # La decodificación del JSON es rápida, puede hacerse de forma síncrona
             try:
                 data = json.loads(message)
             except json.JSONDecodeError:
@@ -226,7 +286,7 @@ async def process_player_image(websocket):
                 CONNECTED_PLAYERS[websocket]['id'] = data['player_id']
                 player_id = data['player_id']
 
-            # 1. MENSAJE DE CONFIGURACIÓN
+            # 1. MENSAJE DE CONFIGURACIÓN (Fijar objetivo manual)
             if (
                 data.get('type') == 'set_target' and 'sign' in data
             ) or (
@@ -240,6 +300,32 @@ async def process_player_image(websocket):
                     "status": "TARGET_SET",
                     "target": new_target,
                 }))
+            
+            # 1.B. NUEVO: ASIGNAR OBJETIVO POR DIFICULTAD
+            elif data.get('type') == 'assign_target' and 'difficulty' in data:
+                difficulty = str(data['difficulty'])
+                
+                # Ejecutar la función de asignación de seña (que consulta Qdrant) en un hilo
+                new_target = await loop.run_in_executor(
+                    None, 
+                    assign_target_sign, # La función a ejecutar síncronamente
+                    difficulty          # Argumento para la función
+                )
+                
+                if new_target:
+                    CONNECTED_PLAYERS[websocket]['target_sign'] = new_target
+                    print(f"[Juego] Jugador {player_id} objetivo asignado a: {new_target} (Dificultad: {difficulty})")
+                    
+                    await websocket.send(json.dumps({
+                        "status": "TARGET_ASSIGNED",
+                        "target": new_target,
+                        "difficulty": difficulty,
+                    }))
+                else:
+                    await websocket.send(json.dumps({
+                        "status": "ERROR",
+                        "message": f"Nivel de dificultad '{difficulty}' inválido o no hay señas en Qdrant.",
+                    }))
 
             # 2. PROCESAMIENTO DE IMAGEN (Ciclo de juego)
             elif data.get('type') == 'image' and CONNECTED_PLAYERS[websocket]['target_sign'] != 'NONE':
@@ -267,7 +353,6 @@ async def process_player_image(websocket):
                     continue # Pasar al siguiente mensaje
                     
                 # --- Ejecución Síncrona Lenta en Hilo (Desbloqueante) ---
-                # Usar None para usar el ThreadPoolExecutor por defecto de asyncio
                 is_correct, feedback, score_percent = await loop.run_in_executor(
                     None, 
                     _perform_sign_validation, 

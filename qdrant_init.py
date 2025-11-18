@@ -5,7 +5,6 @@ from qdrant_client.http.models import PayloadSchemaType
 import numpy as np
 import json
 import os
-
 # --- CONFIGURACIÓN DE CONEXIÓN Y ESTRUCTURA ---
 QDRANT_HOST = os.environ.get("QDRANT_HOST", "localhost")
 QDRANT_PORT = int(os.environ.get("QDRANT_PORT", "6333"))
