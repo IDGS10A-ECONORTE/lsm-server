@@ -11,7 +11,7 @@ import time # Necesario para el delay
 # --- CONFIGURACIÓN GLOBAL ---
 CAMERA_INDEX = 1
 VECTOR_DIMENSION = 60 # 20 landmarks * 3 ejes (X, Y, Z)
-OUTPUT_FILENAME = "lsm_dictionary_data.txt"
+OUTPUT_FILENAME = "lsm_dictionary_data2.txt"
 CAPTURE_DELAY_SECONDS = 3 # Retardo de 3 segundos antes de la captura
 
 # Inicialización de MediaPipe

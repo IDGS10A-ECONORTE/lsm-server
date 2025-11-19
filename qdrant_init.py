@@ -10,7 +10,7 @@ QDRANT_HOST = os.environ.get("QDRANT_HOST", "localhost")
 QDRANT_PORT = int(os.environ.get("QDRANT_PORT", "6333"))
 COLLECTION_NAME = "lsm_signs"
 VECTOR_DIMENSION = 60
-DICTIONARY_FILE = "lsm_dictionary_data.txt" # Nombre del archivo generado por el recorder
+DICTIONARY_FILE = "lsm_dictionary_data2.txt" # Nombre del archivo generado por el recorder
 
 # --- FUNCIÓN DE CARGA DE DATOS ---
 
