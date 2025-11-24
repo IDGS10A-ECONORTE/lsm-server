@@ -12,7 +12,7 @@ import threading
 # --- CONFIGURACIÓN DEL CLIENTE ---
 WEBSOCKET_URL = "ws://localhost:7777"
 # Usar 0 si es la cámara por defecto, o el índice correcto
-CAMERA_INDEX = 1
+CAMERA_INDEX = 0
 FPS_LIMIT = 15 
 FRAME_INTERVAL_MS = int(1000 / FPS_LIMIT)
 
@@ -144,27 +144,35 @@ class GameClientApp:
         try:
             response = json.loads(message)
 
-            if response.get("status") == "NEW_TARGET" or response.get("status") == "TARGET_SET":
-                target = response.get('target', '(Desconocido)')
+            # Caso: el servidor asignó meta o cambió target
+            if response.get("status") in ["NEW_TARGET", "TARGET_SET", "TARGET_ASSIGNED"]:
+                target = response.get("target", '(Desconocido)')
                 self.target_label.config(text=f"Objetivo Actual: {target}", fg="black")
                 self.result_label.config(text="¡Haz la Seña!", fg="blue")
 
+            # Caso: el servidor respondió con validación
             elif "result" in response:
                 is_correct = response["result"]
                 feedback = response.get("feedback", "Procesando...")
                 target = response.get('target', '(Error)')
-                
-                if is_correct:
-                    self.result_label.config(text=f"✅ ¡CORRECTO! ({feedback})", fg="green")
-                else:
-                    self.result_label.config(text=f"❌ INCORRECTO: {feedback}", fg="red")
-                    
-                self.target_label.config(text=f"Objetivo: {target}", fg="black")
 
-        except json.JSONDecodeError:
-            print("Error al decodificar la respuesta JSON.")
+                if is_correct:
+                    self.result_label.config(
+                        text=f"✅ ¡CORRECTO! ({feedback})",
+                        fg="green"
+                    )
+                else:
+                    self.result_label.config(
+                        text=f"❌ INCORRECTO: {feedback}",
+                        fg="red"
+                    )
+
+            else:
+                print("Respuesta desconocida:", response)
+
         except Exception as e:
-            print(f"Error al procesar respuesta: {e}")
+            print("Error en process_server_response:", e)
+
 
     # ---------------------------------
     # --- ENVÍO DE DATOS WS ---
